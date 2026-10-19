@@ -177,6 +177,35 @@ impl OryClients {
             },
         })
     }
+
+    /// Clone these clients with Kratos/Hydra (and optionally Keto) base URLs
+    /// replaced. Oathkeeper stays on the process default: access rules are a
+    /// local file, not a remote admin API. Callers must pass already-validated
+    /// origins (`scheme://host:port`, no path).
+    pub fn retarget(
+        &self,
+        kratos_admin_url: &str,
+        hydra_admin_url: &str,
+        hydra_public_url: &str,
+        keto_read_url: Option<&str>,
+        keto_write_url: Option<&str>,
+        keto_opl_url: Option<&str>,
+    ) -> Self {
+        let mut next = self.clone();
+        next.kratos.base_path = kratos_admin_url.to_owned();
+        next.hydra.base_path = hydra_admin_url.to_owned();
+        next.hydra_public.base_path = hydra_public_url.to_owned();
+        if let Some(url) = keto_read_url {
+            next.keto_read.base_path = url.to_owned();
+        }
+        if let Some(url) = keto_write_url {
+            next.keto_write.base_path = url.to_owned();
+        }
+        if let Some(url) = keto_opl_url {
+            next.keto_opl.base_path = url.to_owned();
+        }
+        next
+    }
 }
 
 #[cfg(test)]

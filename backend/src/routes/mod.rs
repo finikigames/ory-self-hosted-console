@@ -398,8 +398,25 @@ pub fn build(
         .hoop(protected_limiter())
         .hoop(api_key_or_session)
         .hoop(csrf_guard)
+        .hoop(crate::environments::apply_environment)
         .push(Router::with_path("logout").post(login::logout))
         .push(Router::with_path("api/console/me").get(state::me))
+        // Contours (test/prod Kratos+Hydra) configured on the admin account.
+        // `active` is registered before `{id}` so the literal segment is not captured.
+        .push(
+            Router::with_path("api/console/environments/active")
+                .put(crate::environments::set_active),
+        )
+        .push(
+            Router::with_path("api/console/environments/{id}")
+                .put(crate::environments::update_environment)
+                .delete(crate::environments::delete_environment),
+        )
+        .push(
+            Router::with_path("api/console/environments")
+                .get(crate::environments::list_environments)
+                .post(crate::environments::create_environment),
+        )
         // Phase 11 (ACT-04 / PROJ-01 / ACT-03): console-OWNED read views. All
         // inherit `auth_guard` (401 unauth) and are GET-only (csrf-exempt).
         //   - audit: read-only, append-only log view (NO create/edit/delete route,
@@ -485,8 +502,7 @@ pub fn build(
                 .put(crate::features::routes::set_feature), // FLAG-04 toggle (CSRF-guarded, audited)
         )
         .push(
-            Router::with_path("api/console/features")
-                .get(crate::features::routes::list_features), // FLAG-02 read (seeded set + meta)
+            Router::with_path("api/console/features").get(crate::features::routes::list_features), // FLAG-02 read (seeded set + meta)
         )
         // Phase 3 (BACK-02) Ory Admin proof wrappers. GET-only, so `csrf_guard`
         // auto-exempts them; they inherit `auth_guard` (401 when unauthenticated)
@@ -569,8 +585,7 @@ pub fn build(
                 .delete(crate::branding::reset_logo), // BRAND-03 reset (CSRF-guarded)
         )
         .push(
-            Router::with_path("api/console/branding")
-                .get(crate::branding::get_branding), // BRAND-03 state (custom|default)
+            Router::with_path("api/console/branding").get(crate::branding::get_branding), // BRAND-03 state (custom|default)
         )
         // Phase 8 (OAUTH2-01) Hydra OAuth2 client data path. All inherit
         // `auth_guard` (401 unauth); GET is csrf-exempt, while POST/PUT/DELETE
@@ -1040,7 +1055,12 @@ pub fn build(
     // a pure observation — it never short-circuits or alters a response.
     Ok(Router::new()
         .hoop(crate::metrics::latency_hoop)
-        .hoop(affix_state::inject(pool).inject(cfg).inject(ory_clients).inject(flags))
+        .hoop(
+            affix_state::inject(pool)
+                .inject(cfg)
+                .inject(ory_clients)
+                .inject(flags),
+        )
         .get(index)
         .push(public)
         .push(protected))

@@ -2,9 +2,11 @@
 //! channel to the self-hosted Ory services (Kratos/Hydra/Keto/Oathkeeper).
 //!
 //! This module is the SINGLE place that speaks to the Ory Admin APIs; the
-//! frontend never reaches them (BACK-01 invariant). The base URLs are fixed
-//! backend env (not user input) and resolve only on the internal Docker network
-//! (INFRA-05) — there is no SSRF surface here.
+//! frontend never reaches them (BACK-01 invariant). The default base URLs come
+//! from backend env and resolve on the internal Docker network (INFRA-05).
+//! A logged-in operator can point Kratos/Hydra/Keto at another contour via
+//! `environments` (stored on their admin account, applied per session). Those
+//! URLs are validated as bare http(s) origins before any request is sent.
 //!
 //! Layout (this plan establishes the foundation only):
 //! - [`clients`] — `OryClients`: one OpenAPI-generated `Configuration` per
