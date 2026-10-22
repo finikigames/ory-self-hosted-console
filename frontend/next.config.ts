@@ -13,12 +13,21 @@ import type { NextConfig } from "next";
 // container's address on the shared `edge` docker network).
 const BACKEND_INTERNAL = process.env.BACKEND_INTERNAL_URL ?? "http://backend:8080";
 
+// Dev-only. Unset in compose/production, so the cross-origin dev guard stays
+// limited to the hostname Next was started with. Set ALLOWED_DEV_ORIGINS to
+// reach `next dev` from another machine on the LAN (hostnames, no scheme).
+const allowedDevOrigins = (process.env.ALLOWED_DEV_ORIGINS ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter((origin) => origin.length > 0);
+
 const nextConfig: NextConfig = {
   // Emit a self-contained server bundle (.next/standalone) so the runtime
   // Docker stage stays minimal — it copies only the standalone output and runs
   // `node server.js`, no full node_modules tree (T-02-image-bloat mitigation).
   output: "standalone",
   reactStrictMode: true,
+  ...(allowedDevOrigins.length > 0 ? { allowedDevOrigins } : {}),
   async rewrites() {
     return [
       { source: "/backend/:path*", destination: `${BACKEND_INTERNAL}/:path*` },

@@ -5,7 +5,7 @@
 // Composes the Phase-5 DataTable with a fetcher that calls
 // GET /api/kratos/identities?page_size=&page_token= through lib/api.ts (the sole
 // egress — no Ory host literal). Columns: ID (mono, click->detail), Identifier
-// (from traits), State badge, Created. Toolbar: search by identifier + header
+// (from traits), State badge, Created. Toolbar: search by ID/identifier + header
 // actions (Create / Import / Edit schema). Row kebab: View / Edit / Delete
 // (delete is gated behind the destructive AlertDialog).
 //
@@ -177,7 +177,7 @@ export default function UsersPage() {
         fetcher={fetcher}
         queryKey="identities"
         searchColumn="identifier"
-        searchPlaceholder="Search by identifier…"
+        searchPlaceholder="Search by ID, Xsolla ID, or identifier…"
         initialPageSize={PAGE_SIZE}
         caption="Kratos identities"
         rowActions={(row) => <RowActions identity={row} />}

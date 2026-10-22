@@ -216,25 +216,38 @@ pub fn parse_next_page_token(link_header: &str) -> Option<String> {
 /// handler in `kratos.rs` shapes them (stripping credential secrets) before they
 /// reach the client.
 ///
+/// Optional Users-list search filter forwarded to Kratos `GET /admin/identities`.
+///
+/// - [`IdentityListFilter::CredentialsIdentifier`] — exact match on a credential
+///   identifier (`email`, `vk:…`, `google:…`, `device:…`, …).
+/// - [`IdentityListFilter::Ids`] — one or more identity UUIDs via the `ids`
+///   query param. Needed because a Kratos identity `id` is NOT a credential
+///   identifier; searching it with `credentials_identifier` always returns [].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityListFilter<'a> {
+    None,
+    CredentialsIdentifier(&'a str),
+    Ids(&'a str),
+}
+
 /// `base_url` is the FIXED internal Kratos Admin URL from `Config` (never user
-/// input — no SSRF surface, RESEARCH Security Domain). `credentials_identifier`
-/// is the OPTIONAL Users-list search term (an exact-match credential-identifier
-/// filter Kratos supports); it is user input, so it is percent-encoded into the
-/// query (never trusted verbatim) and an empty value is treated as no filter. On
-/// any non-2xx or transport/decode failure the shared [`AppError::Upstream`]
-/// (502) envelope is returned with NO upstream body/host leaked (BACK-07).
+/// input — no SSRF surface, RESEARCH Security Domain). `filter` is the OPTIONAL
+/// Users-list search term; values are percent-encoded into the query (never
+/// trusted verbatim) and [`IdentityListFilter::None`] omits any filter. On any
+/// non-2xx or transport/decode failure the shared [`AppError::Upstream`] (502)
+/// envelope is returned with NO upstream body/host leaked (BACK-07).
 ///
 /// The query string is assembled by the pure [`build_list_url`] helper so the
-/// param-threading (page_size / page_token / `credentials_identifier`) is unit-
-/// testable WITHOUT a live Kratos (WR-01).
+/// param-threading (page_size / page_token / filter) is unit-testable WITHOUT a
+/// live Kratos (WR-01).
 pub async fn list_identities_paged(
     client: &reqwest::Client,
     base_url: &str,
     page_size: i64,
     page_token: Option<&str>,
-    credentials_identifier: Option<&str>,
+    filter: IdentityListFilter<'_>,
 ) -> Result<(Vec<serde_json::Value>, Option<String>), AppError> {
-    let url = build_list_url(base_url, page_size, page_token, credentials_identifier);
+    let url = build_list_url(base_url, page_size, page_token, filter);
 
     let resp = client.get(url).send().await.map_err(map_fallback_err)?;
     let status = resp.status();
@@ -261,15 +274,15 @@ pub async fn list_identities_paged(
 }
 
 /// Build the Kratos `GET /admin/identities` URL with the page_size, an optional
-/// opaque keyset `page_token` cursor, and an optional `credentials_identifier`
-/// search filter (WR-01). Both optional values are percent-encoded; an empty
-/// `credentials_identifier` is omitted entirely (no filter). Pure — no IO — so
-/// the param threading is unit-testable without a live Kratos.
+/// opaque keyset `page_token` cursor, and an optional search [`IdentityListFilter`]
+/// (WR-01). Filter values are percent-encoded; [`IdentityListFilter::None`] and
+/// empty strings omit the filter entirely. Pure — no IO — so the param threading
+/// is unit-testable without a live Kratos.
 fn build_list_url(
     base_url: &str,
     page_size: i64,
     page_token: Option<&str>,
-    credentials_identifier: Option<&str>,
+    filter: IdentityListFilter<'_>,
 ) -> String {
     let mut url = format!(
         "{}/admin/identities?page_size={}",
@@ -281,17 +294,23 @@ fn build_list_url(
         url.push_str("&page_token=");
         url.push_str(&urlencode(tok));
     }
-    // IDENT-01 / WR-01: the Kratos Admin `GET /admin/identities` endpoint
-    // supports a `credentials_identifier` filter (exact-match on a credential
-    // identifier, e.g. an email/username). When the operator types in the
-    // Users-list search box the frontend forwards the term here; thread it to
-    // Kratos (percent-encoded — it is user input, never trusted into the URL
-    // verbatim). An empty term is treated as no filter.
-    if let Some(ident) = credentials_identifier {
-        if !ident.is_empty() {
+    // IDENT-01 / WR-01: Kratos Admin `GET /admin/identities` supports either an
+    // exact-match `credentials_identifier` filter (email / `vk:` / `google:` /
+    // `device:` / …) OR an `ids` filter (identity UUID(s)). The Users-list search
+    // box forwards the operator term here; thread it to Kratos (percent-encoded
+    // — user input, never trusted into the URL verbatim). Empty terms are no-ops.
+    match filter {
+        IdentityListFilter::None => {}
+        IdentityListFilter::CredentialsIdentifier(ident) if !ident.is_empty() => {
             url.push_str("&credentials_identifier=");
             url.push_str(&urlencode(ident));
         }
+        IdentityListFilter::CredentialsIdentifier(_) => {}
+        IdentityListFilter::Ids(ids) if !ids.is_empty() => {
+            url.push_str("&ids=");
+            url.push_str(&urlencode(ids));
+        }
+        IdentityListFilter::Ids(_) => {}
     }
     url
 }
@@ -556,29 +575,67 @@ mod tests {
         let base = "http://kratos:4434";
 
         // No filter, no token: just page_size.
-        let url = build_list_url(base, 20, None, None);
+        let url = build_list_url(base, 20, None, IdentityListFilter::None);
         assert_eq!(url, "http://kratos:4434/admin/identities?page_size=20");
 
         // A search term is appended, percent-encoded (the `@` becomes %40).
-        let url = build_list_url(base, 20, None, Some("a@example.com"));
+        let url = build_list_url(
+            base,
+            20,
+            None,
+            IdentityListFilter::CredentialsIdentifier("a@example.com"),
+        );
         assert!(
             url.contains("&credentials_identifier=a%40example.com"),
             "search term must reach Kratos percent-encoded; got {url}"
         );
 
         // An empty term is treated as NO filter (does not advertise an inert box).
-        let url = build_list_url(base, 20, None, Some(""));
+        let url = build_list_url(
+            base,
+            20,
+            None,
+            IdentityListFilter::CredentialsIdentifier(""),
+        );
         assert!(
             !url.contains("credentials_identifier"),
             "an empty filter must be omitted; got {url}"
         );
 
         // Token AND filter coexist.
-        let url = build_list_url(base, 50, Some("tok123"), Some("bob"));
+        let url = build_list_url(
+            base,
+            50,
+            Some("tok123"),
+            IdentityListFilter::CredentialsIdentifier("bob"),
+        );
         assert!(url.contains("&page_token=tok123"), "token present; got {url}");
         assert!(
             url.contains("&credentials_identifier=bob"),
             "filter present alongside token; got {url}"
+        );
+    }
+
+    /// Identity UUID search must use Kratos `ids=`, not `credentials_identifier`
+    /// — an identity `id` is not a credential identifier.
+    #[test]
+    fn build_list_url_threads_ids_filter() {
+        let base = "http://kratos:4434";
+        let id = "3c70f6ed-c046-40ff-8996-b4b044b27185";
+        let url = build_list_url(base, 20, None, IdentityListFilter::Ids(id));
+        assert!(
+            url.contains(&format!("&ids={id}")),
+            "UUID search must use ids=; got {url}"
+        );
+        assert!(
+            !url.contains("credentials_identifier"),
+            "ids filter must not also send credentials_identifier; got {url}"
+        );
+
+        let url = build_list_url(base, 20, None, IdentityListFilter::Ids(""));
+        assert!(
+            !url.contains("ids="),
+            "empty ids filter must be omitted; got {url}"
         );
     }
 

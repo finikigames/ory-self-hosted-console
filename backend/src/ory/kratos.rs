@@ -29,12 +29,18 @@
 //! - **T-06-06 (no secret logging):** cleartext `password` / `hashed_password`
 //!   are NEVER written to logs (BACK-07).
 
+use std::time::Duration;
+
 use ory_kratos_client::apis::identity_api;
 use ory_kratos_client::models::{
     CourierMessageStatus, CreateIdentityBody, IdentityPatch, PatchIdentitiesBody,
     UpdateIdentityBody,
 };
 use salvo::prelude::*;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use tokio::sync::OnceCell;
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::config_edit::routes::identity_schema_path;
@@ -44,6 +50,10 @@ use crate::ory::clients::OryClients;
 use crate::ory::error::map_kratos_err;
 use crate::ory::fallback;
 use crate::ory::DEFAULT_LIST_PAGE_SIZE;
+
+/// Optional pool for metadata lookups (`xsolla_user_id`) that Kratos Admin
+/// cannot filter. Built on first use from `KRATOS_DATABASE_URL` when set.
+static KRATOS_META_POOL: OnceCell<PgPool> = OnceCell::const_new();
 
 /// IDENT-04 limit: at most this many patches per batch when EVERY credential is
 /// pre-hashed (`hashed_password`) — Kratos does no hashing work.
@@ -98,6 +108,60 @@ fn ory_clients(depot: &mut Depot) -> Result<OryClients, AppError> {
         .cloned()
 }
 
+/// True when `raw` is an 8-4-4-4-12 hex UUID (case-insensitive). Used to route
+/// Users-list search to Kratos `ids=` instead of `credentials_identifier`.
+fn looks_like_uuid(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    let is_hex = |c: u8| c.is_ascii_hexdigit();
+    let dash = |i: usize| b[i] == b'-';
+    b[0..8].iter().copied().all(is_hex)
+        && dash(8)
+        && b[9..13].iter().copied().all(is_hex)
+        && dash(13)
+        && b[14..18].iter().copied().all(is_hex)
+        && dash(18)
+        && b[19..23].iter().copied().all(is_hex)
+        && dash(23)
+        && b[24..36].iter().copied().all(is_hex)
+}
+
+/// Resolve a game / Xsolla user id stored on `identities.metadata_public` to the
+/// Kratos identity UUID. Returns `Ok(None)` when `KRATOS_DATABASE_URL` is unset
+/// (Admin API cannot filter metadata) or when no row matches.
+async fn identity_id_by_xsolla_user_id(xsolla: &str) -> Result<Option<String>, AppError> {
+    let dsn = match std::env::var("KRATOS_DATABASE_URL") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Ok(None),
+    };
+
+    let pool = KRATOS_META_POOL
+        .get_or_try_init(|| async move {
+            PgPoolOptions::new()
+                .max_connections(2)
+                .acquire_timeout(Duration::from_secs(3))
+                .connect(&dsn)
+                .await
+        })
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "KRATOS_DATABASE_URL connect failed");
+            AppError::Upstream("kratos database unreachable".into())
+        })?;
+
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM identities WHERE metadata_public->>'xsolla_user_id' = $1 LIMIT 1",
+    )
+    .bind(xsolla)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::Db)?;
+
+    Ok(row.map(|(id,)| id.to_string()))
+}
+
 // =============================================================================
 // IDENT-01: list (keyset cursor) + detail
 // =============================================================================
@@ -127,26 +191,52 @@ pub async fn list_identities(
         .filter(|n| *n > 0 && *n <= 1000)
         .unwrap_or(DEFAULT_LIST_PAGE_SIZE);
     let page_token = req.query::<String>("page_token");
-    // IDENT-01 / WR-01: optional exact-match search filter from the Users-list
-    // search box. Kratos's `GET /admin/identities` accepts `credentials_identifier`;
-    // we forward a non-empty (trimmed) term and treat blank/whitespace as no
-    // filter so an empty search box returns the full page rather than nothing.
-    let credentials_identifier = req
+    // IDENT-01 / WR-01: optional search filter from the Users-list search box.
+    // A Kratos identity UUID is looked up via `ids=` — it is NOT a credential
+    // identifier, so `credentials_identifier=<uuid>` always returns []. Emails
+    // and social prefixes (`vk:`, `google:`, `device:`, …) still go through
+    // `credentials_identifier`. Blank/whitespace is no filter.
+    let search_term = req
         .query::<String>("credentials_identifier")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let filter = match search_term.as_deref() {
+        None => fallback::IdentityListFilter::None,
+        Some(term) if looks_like_uuid(term) => fallback::IdentityListFilter::Ids(term),
+        Some(term) => fallback::IdentityListFilter::CredentialsIdentifier(term),
+    };
 
     // The Kratos Admin base URL is fixed backend config (no SSRF surface). Build
     // a bounded reqwest-0.13 client for the one list call.
     let http = fallback::fallback_client()?;
-    let (rows, next_token) = fallback::list_identities_paged(
+    let base = clients_kratos_base(&clients);
+    let (mut rows, mut next_token) = fallback::list_identities_paged(
         &http,
-        &clients_kratos_base(&clients),
+        &base,
         page_size,
         page_token.as_deref(),
-        credentials_identifier.as_deref(),
+        filter,
     )
     .await?;
+
+    // UUID miss on `ids=`: also try metadata_public.xsolla_user_id (game id).
+    // Kratos Admin has no metadata filter; this needs KRATOS_DATABASE_URL.
+    if rows.is_empty() {
+        if let Some(term) = search_term.as_deref().filter(|t| looks_like_uuid(t)) {
+            if let Some(resolved) = identity_id_by_xsolla_user_id(term).await? {
+                let (r2, n2) = fallback::list_identities_paged(
+                    &http,
+                    &base,
+                    page_size,
+                    None,
+                    fallback::IdentityListFilter::Ids(&resolved),
+                )
+                .await?;
+                rows = r2;
+                next_token = n2;
+            }
+        }
+    }
 
     // Strip credential secrets from EVERY row (T-06-01).
     let shaped: Vec<serde_json::Value> =
@@ -933,6 +1023,16 @@ mod tests {
     fn limits_constants_exposed() {
         let (h, c) = batch_limits();
         assert_eq!((h, c), (1000, 200));
+    }
+
+    #[test]
+    fn looks_like_uuid_accepts_identity_ids_only() {
+        assert!(looks_like_uuid("3c70f6ed-c046-40ff-8996-b4b044b27185"));
+        assert!(looks_like_uuid("3C70F6ED-C046-40FF-8996-B4B044B27185"));
+        assert!(!looks_like_uuid("vk:228406235"));
+        assert!(!looks_like_uuid("finikibotlike@gmail.com"));
+        assert!(!looks_like_uuid("3c70f6edc04640ff8996b4b044b27185"));
+        assert!(!looks_like_uuid(""));
     }
 
     // =========================================================================
